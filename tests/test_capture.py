@@ -189,6 +189,14 @@ ENTRIES = [
         "ips": ["192.168.56.1"],
         "ipv4_metric": 1,
     },
+    {
+        "name": "以太网",
+        "description": "Realtek PCIe GbE",
+        "guid": "{33333333-2222-3333-4444-555555555555}",
+        "mac": "aa:bb:cc:dd:ee:11",
+        "ips": ["169.254.123.208"],
+        "ipv4_metric": 5,
+    },
 ]
 
 
@@ -246,6 +254,8 @@ class ScapyBackendTests(unittest.TestCase):
         self.assertTrue(devices[0].ips)
         self.assertFalse(devices[0].virtual)
         self.assertTrue(devices[1].virtual)
+        # 169.254 的 APIPA 地址不算可用 IPv4，排最后
+        self.assertTrue(devices[2].ips[0].startswith("169.254."))
         # 有 IPv4 的物理网卡排最前
         self.assertIn("Intel", devices[0].description)
 

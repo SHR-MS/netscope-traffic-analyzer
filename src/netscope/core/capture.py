@@ -182,10 +182,17 @@ class ScapyBackend:
 
     @staticmethod
     def _rank(device: DeviceInfo):
-        """有 IPv4 的排前面，物理网卡优先，metric 小的优先。"""
-        has_ipv4 = any("." in ip for ip in device.ips)
+        """有可用 IPv4 的排前面，物理网卡优先，metric 小的优先。
+
+        169.254.x.x 是 APIPA（没拿到 DHCP 时的地址），不算可用 IPv4，
+        否则未插网线的有线网卡会排在正在用的 Wi-Fi 前面。
+        """
+        has_usable_ipv4 = any(
+            "." in ip and not ip.startswith("169.254.") and ip != "0.0.0.0"
+            for ip in device.ips
+        )
         return (
-            0 if has_ipv4 else 1,
+            0 if has_usable_ipv4 else 1,
             1 if device.virtual else 0,
             device.metric,
             device.description.lower(),
