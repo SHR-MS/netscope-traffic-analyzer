@@ -1,7 +1,7 @@
-# NetScope 界面骨架（base）
+# NetScope 界面 + 采集链路（base）
 
 仿 Wireshark 的主界面：工具栏 + 报文列表 + 三层字段详情 + 十六进制 + 右侧统计面板。
-**只有界面，没有抓包逻辑**；抓包、解析、统计、存盘通过 `CaptureController` 接口接入。
+采集由 `core/capture.py` 完成，`ui/live_controller.py` 把帧送进界面；解析、统计、存盘仍在后续阶段。
 
 ![界面预览](../docs/ui-preview.png)
 
@@ -9,8 +9,9 @@
 
 ```powershell
 python -m pip install -r requirements.txt
-python src/main.py            # 默认加载演示数据，直接能看到效果
-python src/main.py --no-demo  # 空界面，等后端接入
+python src/main.py --list     # 只列网卡，不需要管理员
+python src/main.py            # 真实抓包（Npcap + 管理员）
+python src/main.py --demo     # 演示数据，只看界面
 ```
 
 当前机器若没装 PySide6，`main.py` 会提示安装命令后退出，不会抛一堆 traceback。
@@ -33,20 +34,41 @@ python src/main.py --no-demo  # 空界面，等后端接入
 
 ```
 src/
-├─ main.py                    # 入口：创建 QApplication、应用样式、开窗
+├─ main.py                    # 入口：--list / 真实抓包 / --demo
 ├─ smoke_test.py              # 冒烟测试，可截图
 ├─ requirements.txt           # 在 base/ 下
 └─ netscope/
-   ├─ ui/
-   │  ├─ controller.py        # 后端接口（信号 + 数据结构约定）
-   │  ├─ models.py            # PacketRow、表格模型、显示过滤器
-   │  ├─ widgets.py           # 详情树、十六进制、告警表
-   │  ├─ charts.py            # 折线图、柱状图（QPainter 自绘）
-   │  ├─ demo.py              # 演示数据源（假报文）
-   │  ├─ main_window.py       # 主窗口装配
-   │  └─ style.py             # QSS 浅色主题
-   └─ __init__.py
+   ├─ config.py               # CaptureConfig
+   ├─ core/
+   │  ├─ diagnostics.py       # Scapy / Npcap / 管理员自检
+   │  ├─ errors.py
+   │  ├─ models.py            # CaptureState / DeviceInfo / Frame / CaptureStats
+   │  └─ capture.py           # CaptureEngine + ScapyBackend
+   └─ ui/
+      ├─ live_controller.py   # 采集引擎 → Qt 信号（100 ms 批量取帧）
+      ├─ preview.py           # 以太网头预览
+      ├─ controller.py        # 后端接口（信号 + 数据结构约定）
+      ├─ models.py            # PacketRow、表格模型、显示过滤器
+      ├─ widgets.py           # 详情树、十六进制、告警表
+      ├─ charts.py            # 折线图、柱状图（QPainter 自绘）
+      ├─ demo.py              # 演示数据源（假报文）
+      ├─ main_window.py       # 主窗口装配
+      └─ style.py             # QSS 浅色主题
 ```
+
+## 采集链路
+
+```
+Npcap → AsyncSniffer 回调 → Frame → 有界队列 → QTimer(100ms) → PacketRow → 列表/详情/十六进制
+```
+
+- 回调只做 `bytes(pkt)` 和入队，不在抓包线程里解析或画界面；
+- 队列默认 20000 条，满了丢新包并计入 `dropped`；
+- 启动前检查 Scapy、`wpcap.dll`、管理员权限，缺什么给可操作提示；
+- 设备按“有 IPv4 > 物理网卡 > metric 小”排序，默认选第一块；
+- Scapy 的 pcap socket 固定用 65535 的 snaplen，所以 `CaptureConfig.snaplen` 目前只是预留字段。
+
+采集阶段只解以太网头（MAC / VLAN / EtherType），网络层和传输层在详情树里标“待解析”。
 
 ## 后端接入契约
 
@@ -121,9 +143,9 @@ window.show()
 
 ## 演示数据说明
 
-`demo.py` 每秒生成若干**假报文**（TCP 握手、HTTP、DNS、ICMP、ARP、IPv6），
-用于展示界面、图表和告警交互。数据结构与真实后端完全一致，替换控制器即可，
-界面代码一行不用改。状态栏会显示“演示数据”标记，避免误认为在真抓包。
+`python src/main.py --demo` 会加载 `demo.py` 生成的**假报文**（TCP 握手、HTTP、DNS、ICMP、ARP、IPv6），
+用于在没有 Npcap 时查看界面、图表和告警交互。状态栏会显示“演示数据”标记。
+真实抓包默认走 `LiveController`，不需要改界面代码。
 
 ## 冒烟测试
 
@@ -135,6 +157,7 @@ python src/smoke_test.py --shot ui.png   # 保存截图
 
 ## 已知限制（后续可加）
 
+- 详情树目前只解到链路层，网络层/传输层标注“待解析”（下一阶段接 `core/parser.py`）；
 - 列表不支持点击表头排序（排序会打乱“序号”的时序含义）；
 - “显示过滤”是子串匹配，不是 Wireshark 的显示过滤语法；
 - 列表只保留最近 5000 行，完整数据以后端/文件为准；

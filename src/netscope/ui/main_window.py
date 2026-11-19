@@ -1,7 +1,7 @@
 """主窗口：仿抓包软件的列表 + 详情 + 十六进制 + 统计面板布局。
 
 界面只通过 :class:`CaptureController` 的信号拿数据；
-默认用 :class:`DemoController` 生成演示报文，真实后端接入时替换控制器即可。
+默认接真实采集（:class:`LiveController`），``--demo`` 时用演示数据源。
 """
 
 from __future__ import annotations
@@ -32,14 +32,20 @@ from PySide6.QtWidgets import (
 from .charts import BarChart, LineChart
 from .controller import CaptureController
 from .demo import DemoController
+from .live_controller import LiveController
 from .models import PacketFilterProxy, PacketRow, PacketTableModel
 from .widgets import AlertsView, DetailTree, HexView
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, controller: CaptureController | None = None, demo: bool = True, parent=None) -> None:
+    def __init__(self, controller: CaptureController | None = None, demo: bool = False, parent=None) -> None:
         super().__init__(parent)
-        self.controller = controller or (DemoController(self) if demo else CaptureController(self))
+        if controller is not None:
+            self.controller = controller
+        elif demo:
+            self.controller = DemoController(self)
+        else:
+            self.controller = LiveController(parent=self)
 
         self._alert_count = 0
         self._follow = True
@@ -374,8 +380,13 @@ class MainWindow(QMainWindow):
                 "当前只有界面骨架，抓包后端尚未连接。\n"
                 "接入方法见 src/README.md 的“后端接入”一节。",
             )
+            return
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "启动失败", str(exc))
+            return
+
+        # 新一次抓包从干净列表开始
+        self._clear_all()
 
     def _on_stop(self) -> None:
         try:
@@ -457,13 +468,15 @@ class MainWindow(QMainWindow):
 
     # ================================================================ 其他
     def _show_about(self) -> None:
+        mode = "演示数据" if self.controller.demo else "真实抓包（需要 Npcap + 管理员）"
         QMessageBox.about(
             self,
             "关于 NetScope",
             "<b>NetScope 网络流量分析系统</b><br><br>"
-            "界面骨架（PySide6）：报文列表、三层字段详情、十六进制、"
+            "PySide6 界面 + Scapy/Npcap 采集：报文列表、三层字段详情、十六进制、"
             "长度分布 / 长度分段 / IP 版本图表、告警列表。<br><br>"
-            "当前为演示数据；抓包与解析逻辑通过 CaptureController 接入。",
+            f"当前模式：{mode}。<br>"
+            "字段解析与统计仍在接入中，详情树暂只显示链路层。",
         )
 
     def _show_usage(self) -> None:
@@ -474,7 +487,8 @@ class MainWindow(QMainWindow):
             "2. 点击报文行，下方显示字段详情和十六进制。\n"
             "3. 右侧“统计”面板：长度分布、长度分段、IP 版本、告警。\n"
             "4. 顶部“显示过滤”只过滤列表，不影响抓包。\n\n"
-            "当前默认加载演示数据；真实后端接入方式见 src/README.md。",
+            "没有 Npcap 或不是管理员时，启动会给出提示；\n"
+            "只想看界面可用 --demo 启动演示数据。",
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名

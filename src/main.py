@@ -2,8 +2,9 @@
 
 用法::
 
-    python src/main.py            # 默认加载演示数据
-    python src/main.py --no-demo  # 空界面，等待后端接入
+    python src/main.py            # 真实抓包（需要 Npcap + 管理员）
+    python src/main.py --demo     # 演示数据，只看界面
+    python src/main.py --list     # 只列出网卡，不开界面
 """
 
 from __future__ import annotations
@@ -22,8 +23,31 @@ def _missing_pyside() -> int:
     return 2
 
 
+def _list_devices() -> int:
+    from netscope.core.capture import ScapyBackend
+
+    try:
+        devices = ScapyBackend().list_devices()
+    except Exception as exc:  # noqa: BLE001
+        print(f"枚举网卡失败：{exc}")
+        return 2
+
+    if not devices:
+        print("没有找到可用网卡。")
+        return 2
+
+    print(f"共 {len(devices)} 块网卡：")
+    for index, device in enumerate(devices, start=1):
+        print(f"{index:>2}. {device.display()}")
+        print(f"    key: {device.key}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
+
+    if "--list" in argv:
+        return _list_devices()
 
     try:
         from PySide6.QtCore import Qt
@@ -48,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from netscope.ui.main_window import MainWindow
 
-    window = MainWindow(demo="--no-demo" not in argv)
+    window = MainWindow(demo="--demo" in argv)
     window.show()
     return app.exec()
 
