@@ -55,10 +55,9 @@ class LiveController(CaptureController):
 
     # ---------------------------------------------------------------- 设备
     def list_devices(self) -> list[DeviceOption]:
-        try:
-            devices = self._engine.list_devices()
-        except Exception:  # noqa: BLE001 - 枚举失败只显示空列表
-            return []
+        # 枚举失败（例如当前解释器没装 Scapy）时让异常向上抛，
+        # 由界面把原因显示出来，而不是静默返回空列表。
+        devices = self._engine.list_devices()
         return [DeviceOption(device.key, device.display()) for device in devices]
 
     # ---------------------------------------------------------------- 启停

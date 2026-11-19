@@ -294,16 +294,30 @@ class MainWindow(QMainWindow):
     def _refresh_devices(self) -> None:
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
+
+        error = ""
         try:
             devices = self.controller.list_devices()
-        except Exception:  # noqa: BLE001 - 枚举失败不应让界面崩
+        except Exception as exc:  # noqa: BLE001 - 枚举失败不应让界面崩
             devices = []
+            error = str(exc)
+
         for device in devices:
             self.device_combo.addItem(device.label, device.key)
+
         if not devices:
-            self.device_combo.addItem("（无可用网卡）", None)
+            label = "（无可用网卡）" if not error else "（网卡枚举失败，见下方提示）"
+            self.device_combo.addItem(label, None)
+            self.device_combo.setToolTip(error)
+            self.statusBar().showMessage(
+                f"网卡枚举失败：{error}" if error else "没有可用网卡，请检查 Npcap 与 Scapy",
+                15000,
+            )
+        else:
+            self.device_combo.setToolTip("")
+            self.statusBar().showMessage(f"共 {len(devices)} 块网卡", 3000)
+
         self.device_combo.blockSignals(False)
-        self.statusBar().showMessage(f"共 {len(devices)} 块网卡", 3000)
 
     # ================================================================ 数据
     def _on_packets(self, rows: list[PacketRow]) -> None:
@@ -369,7 +383,11 @@ class MainWindow(QMainWindow):
     def _on_start(self) -> None:
         device = self.device_combo.currentData()
         if not device:
-            QMessageBox.warning(self, "无法开始", "没有可用网卡，请先刷新设备列表。")
+            reason = self.device_combo.toolTip()
+            message = "没有可用网卡，请先刷新设备列表。"
+            if reason:
+                message += f"\n\n原因：{reason}"
+            QMessageBox.warning(self, "无法开始", message)
             return
         try:
             self.controller.start(str(device), "")
