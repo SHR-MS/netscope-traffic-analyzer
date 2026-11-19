@@ -13,7 +13,8 @@
 - 真实抓包：Scapy + Npcap，设备枚举、状态机、有界队列、丢包计数、环境自检
 - 报文列表：序号 / 时间 / 源地址 / 目的地址 / 协议 / 长度 / 信息，协议着色，最多 5000 行
 - 十六进制视图：偏移 + hex + ASCII
-- 采集阶段预览：解出以太网头（MAC、VLAN、EtherType），网络/传输层标注“待解析”
+- 链路层解析：解出以太网头（MAC、VLAN 标签、EtherType、载荷偏移），网络/传输层标注“待解析”
+- 解析范围与后续计划见 [docs/解析清单.md](docs/解析清单.md)
 - 统计面板：长度分布折线、长度分段柱状、IP 版本柱状、告警列表（等待统计模块接入）
 - 运行时长、包数、丢包、pps 状态展示
 - `--demo` 演示数据模式，方便没有 Npcap 时查看界面
@@ -32,10 +33,11 @@
 │     │  ├─ diagnostics.py    # Scapy / Npcap / 管理员自检
 │     │  ├─ errors.py
 │     │  ├─ models.py         # CaptureState / DeviceInfo / Frame / CaptureStats
-│     │  └─ capture.py        # CaptureEngine + ScapyBackend
+│     │  ├─ capture.py        # CaptureEngine + ScapyBackend
+│     │  └─ parser.py         # 链路层解析（阶段 1）
 │     └─ ui/
 │        ├─ live_controller.py# 采集引擎 → Qt 信号
-│        ├─ preview.py        # 以太网头预览（完整解析在下一阶段）
+│        ├─ packet_rows.py    # ParsedFrame → PacketRow
 │        ├─ controller.py     # 后端接口
 │        ├─ models.py         # PacketRow、表格模型、过滤器
 │        ├─ widgets.py        # 详情树、十六进制、告警表
@@ -44,7 +46,9 @@
 │        ├─ main_window.py    # 主窗口
 │        └─ style.py          # 浅色主题
 ├─ tests/                     # unittest，不需要 Npcap
-├─ docs/ui-preview.png
+├─ docs/
+│  ├─ ui-preview.png
+│  └─ 解析清单.md              # 解析范围、边界、阶段计划
 ├─ requirements.txt
 └─ .gitignore
 ```
@@ -75,7 +79,7 @@ Npcap 下载：<https://npcap.com/#download>。安装时取消 “Restrict Npcap
 python -m unittest discover -s tests -t . -v
 ```
 
-覆盖：引擎状态机、队列丢弃、统计计数、Scapy 设备映射、启动失败、以太网/VLAN 预览、环境自检、LiveController 到界面的信号桥接。
+覆盖：引擎状态机、队列丢弃、统计计数、Scapy 设备映射、启动失败、链路层解析（以太网/VLAN/QinQ/截断）、环境自检、LiveController 到界面的信号桥接。
 
 冒烟测试（无显示环境）：
 

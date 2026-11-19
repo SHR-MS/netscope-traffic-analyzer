@@ -43,10 +43,11 @@ src/
    │  ├─ diagnostics.py       # Scapy / Npcap / 管理员自检
    │  ├─ errors.py
    │  ├─ models.py            # CaptureState / DeviceInfo / Frame / CaptureStats
-   │  └─ capture.py           # CaptureEngine + ScapyBackend
+   │  ├─ capture.py           # CaptureEngine + ScapyBackend
+   │  └─ parser.py            # 链路层解析（阶段 1）
    └─ ui/
       ├─ live_controller.py   # 采集引擎 → Qt 信号（100 ms 批量取帧）
-      ├─ preview.py           # 以太网头预览
+      ├─ packet_rows.py       # ParsedFrame → PacketRow
       ├─ controller.py        # 后端接口（信号 + 数据结构约定）
       ├─ models.py            # PacketRow、表格模型、显示过滤器
       ├─ widgets.py           # 详情树、十六进制、告警表
@@ -59,7 +60,8 @@ src/
 ## 采集链路
 
 ```
-Npcap → AsyncSniffer 回调 → Frame → 有界队列 → QTimer(100ms) → PacketRow → 列表/详情/十六进制
+Npcap → AsyncSniffer 回调 → Frame → 有界队列 → QTimer(100ms)
+      → core.parser.parse_frame → ui.packet_rows.build_packet_row → 列表/详情/十六进制
 ```
 
 - 回调只做 `bytes(pkt)` 和入队，不在抓包线程里解析或画界面；
@@ -68,7 +70,7 @@ Npcap → AsyncSniffer 回调 → Frame → 有界队列 → QTimer(100ms) → P
 - 设备按“有 IPv4 > 物理网卡 > metric 小”排序，默认选第一块；
 - Scapy 的 pcap socket 固定用 65535 的 snaplen，所以 `CaptureConfig.snaplen` 目前只是预留字段。
 
-采集阶段只解以太网头（MAC / VLAN / EtherType），网络层和传输层在详情树里标“待解析”。
+当前解析只到链路层（MAC / VLAN / EtherType / 载荷偏移），网络层和传输层在详情树里标“待解析”。解析范围和后续计划见 [解析清单](../docs/解析清单.md)。
 
 ## 后端接入契约
 

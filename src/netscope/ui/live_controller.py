@@ -9,8 +9,9 @@ from PySide6.QtCore import QTimer
 from ..config import CaptureConfig
 from ..core.capture import CaptureBackend, CaptureEngine
 from ..core.models import CaptureState
+from ..core.parser import parse_frame
 from .controller import CaptureController, DeviceOption
-from .preview import build_preview_row
+from .packet_rows import build_packet_row
 
 STATE_MAP = {
     CaptureState.IDLE: "idle",
@@ -104,7 +105,7 @@ class LiveController(CaptureController):
         rows = []
         for frame in frames:
             self._seq += 1
-            rows.append(build_preview_row(frame, self._seq))
+            rows.append(build_packet_row(parse_frame(frame), self._seq))
         self.packets_received.emit(rows)
 
     def _emit_stats(self) -> None:

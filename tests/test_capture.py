@@ -1,4 +1,4 @@
-"""抓包链路单元测试：引擎、Scapy 后端映射、预览、环境自检。
+"""抓包链路单元测试：引擎、Scapy 后端映射、环境自检。
 
 运行（在 base 目录）::
 
@@ -17,7 +17,6 @@ from netscope.config import CaptureConfig
 from netscope.core.capture import CaptureEngine, ScapyBackend
 from netscope.core.errors import CaptureError, CaptureStartError, CaptureUnavailable
 from netscope.core.models import CaptureState, CaptureStats, DeviceInfo, Frame
-from netscope.ui.preview import build_preview_row
 
 
 def make_frame(ts: float = 1.0, size: int = 60) -> Frame:
@@ -299,50 +298,6 @@ class ScapyBackendTests(unittest.TestCase):
         with self.assertRaises(CaptureStartError):
             engine.start()
         self.assertIs(engine.state, CaptureState.ERROR)
-
-
-class PreviewTests(unittest.TestCase):
-    @staticmethod
-    def ethernet(ether_type: int = 0x0800, vlan: int | None = None) -> bytes:
-        header = bytes.fromhex("00112233445566778899aabb")
-        if vlan is None:
-            return header + ether_type.to_bytes(2, "big") + b"\x45" + b"\x00" * 19
-        return (
-            header
-            + (0x8100).to_bytes(2, "big")
-            + vlan.to_bytes(2, "big")
-            + ether_type.to_bytes(2, "big")
-            + b"\x45"
-            + b"\x00" * 19
-        )
-
-    def test_ipv4_preview(self) -> None:
-        data = self.ethernet()
-        frame = Frame(ts=1.0, caplen=len(data), origlen=len(data), data=data)
-        row = build_preview_row(frame, 7)
-
-        self.assertEqual(row.seq, 7)
-        self.assertEqual(row.protocol, "IPv4")
-        self.assertEqual(row.version, 4)
-        self.assertEqual(row.src, "66:77:88:99:aa:bb")
-        self.assertEqual(row.dst, "00:11:22:33:44:55")
-        self.assertEqual(row.length, len(data))
-        self.assertIn("数据链路层", row.layers[0][0])
-
-    def test_vlan_preview(self) -> None:
-        data = self.ethernet(vlan=100)
-        frame = Frame(ts=1.0, caplen=len(data), origlen=len(data), data=data)
-        row = build_preview_row(frame, 1)
-        link_fields = dict(row.layers[0][1])
-        self.assertEqual(link_fields["VLAN ID"], "100")
-        self.assertEqual(row.protocol, "IPv4")
-
-    def test_truncated_preview(self) -> None:
-        data = b"\x00" * 10
-        frame = Frame(ts=1.0, caplen=len(data), origlen=len(data), data=data)
-        row = build_preview_row(frame, 2)
-        self.assertTrue(row.info.startswith("截断帧"))
-        self.assertEqual(row.protocol, "0x0000")
 
 
 class DiagnosticsTests(unittest.TestCase):
