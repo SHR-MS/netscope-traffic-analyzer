@@ -69,6 +69,10 @@ class CaptureController(QObject):
     def open_file(self, path: str) -> None:
         raise NotImplementedError("文件读取后端尚未接入")
 
+    def session_dir(self):
+        """本次捕获的自动落盘目录；未捕获时返回 None。"""
+        return None
+
     # ---------------------------------------------------------------- 退出
     def shutdown(self) -> None:
         """主窗口关闭时调用，释放线程/句柄。"""

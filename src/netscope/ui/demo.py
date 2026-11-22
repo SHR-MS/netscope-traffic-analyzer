@@ -1,7 +1,11 @@
-"""演示数据源：让界面在没有接抓包后端时也能看到效果。
+"""演示数据源：让界面在没有接真实后端时也能看到完整效果。
 
-重要：这里的数据全部是伪造的，仅用于展示界面与交互。
-真实实现请继承 :class:`CaptureController`，把解析结果按同样的结构发出来。
+说明：这里的报文是伪造的，但全部是**结构合法的真实字节**，走与真实抓包
+完全相同的链路（parse_frame → TrafficStats → AlertEngine → build_packet_row），
+因此列表、详情树、统计图表与告警的行为与真实抓包一致。
+
+除普通流量外，每 30 秒轮换演示一次异常场景（SYN 泛洪 / ICMP 回声泛洪 /
+无请求应答 / 大包回声），让告警面板能看到真实检测引擎的判定。
 """
 
 from __future__ import annotations
@@ -11,11 +15,18 @@ import socket
 import struct
 import time
 from collections import deque
+from pathlib import Path
 
 from PySide6.QtCore import QTimer
 
+from ..config import AlertConfig
+from ..core.alerts import AlertEngine
+from ..core.models import Frame
+from ..core.parser import parse_frame
+from ..core.pcapio import PcapError, PcapWriter, read_frames
+from ..core.stats import TrafficStats
 from .controller import CaptureController, DeviceOption
-from .models import PacketRow
+from .packet_rows import build_packet_row
 
 CLIENT_MAC = "3c:52:82:1a:2b:3c"
 GATEWAY_MAC = "a4:5e:60:de:f0:11"
@@ -23,33 +34,31 @@ BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
 CLIENT_IP = "192.168.1.23"
 SERVER_IP = "93.184.216.34"
 GATEWAY_IP = "192.168.1.1"
+FLOOD_TARGET = "192.168.1.50"
 CLIENT_IP6 = "2001:db8::23"
 DNS_IP6 = "2001:4860:4860::8888"
 
-TCP_FLAGS = [("FIN", 0x01), ("SYN", 0x02), ("RST", 0x04), ("PSH", 0x08), ("ACK", 0x10)]
-FLAG_DISPLAY = [("SYN", 0x02), ("ACK", 0x10), ("FIN", 0x01), ("RST", 0x04)]
+BURST_INTERVAL_MS = 30000      # 每 30 秒演示一种异常
+MAX_DEMO_FRAMES = 50_000       # 演示模式内存里保留的帧数上限
 
 
 def _mac(text: str) -> bytes:
     return bytes.fromhex(text.replace(":", ""))
 
 
-def _flags_text(flags: int) -> str:
-    return " ".join(f"{name}={1 if flags & bit else 0}" for name, bit in FLAG_DISPLAY)
-
-
 def _eth(dst_mac: str, src_mac: str, ethertype: int, payload: bytes) -> bytes:
     return _mac(dst_mac) + _mac(src_mac) + struct.pack("!H", ethertype) + payload
 
 
-def _ipv4(src: str, dst: str, protocol: int, payload: bytes, ttl: int = 64) -> bytes:
+def _ipv4(src: str, dst: str, protocol: int, payload: bytes,
+          ttl: int = 64, flags: int = 0x4000) -> bytes:
     header = struct.pack(
         "!BBHHHBBH4s4s",
         0x45,
         0,
         20 + len(payload),
         random.randint(1, 65535),
-        0x4000,
+        flags,
         ttl,
         protocol,
         0,
@@ -85,36 +94,8 @@ def _icmp(icmp_type: int, code: int, payload: bytes) -> bytes:
     return struct.pack("!BBH", icmp_type, code, 0) + payload
 
 
-def _layers_eth(dst_mac: str, src_mac: str, type_text: str):
-    return [
-        ("目的 MAC", dst_mac),
-        ("源 MAC", src_mac),
-        ("类型", type_text),
-    ]
-
-
-def _layers_ipv4(src: str, dst: str, protocol: int, ttl: int = 64):
-    proto_name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(protocol, str(protocol))
-    return [
-        ("版本", "4"),
-        ("源 IP", src),
-        ("目的 IP", dst),
-        ("TTL", str(ttl)),
-        ("协议号", f"{protocol} ({proto_name})"),
-    ]
-
-
-def _layers_tcp(sport: int, dport: int, flags: int, seq: int = 0, ack: int = 0):
-    # 只保留需求要求的关键字段；序号/确认号属于附加信息，默认不展开
-    return [
-        ("源端口", str(sport)),
-        ("目的端口", str(dport)),
-        ("标志位", _flags_text(flags)),
-    ]
-
-
 class DemoController(CaptureController):
-    """生成假报文的控制器，接口与真实后端一致。"""
+    """生成合法字节流并走真实解析/统计/告警链路的演示控制器。"""
 
     demo = True
 
@@ -122,9 +103,9 @@ class DemoController(CaptureController):
         super().__init__(parent)
         self._running = False
         self._seq = 0
-        self._received = 0
-        self._hist: dict[int, int] = {}
-        self._versions = [0, 0, 0]
+        self._stats = TrafficStats()
+        self._alerts = AlertEngine(AlertConfig())
+        self._frames: list[Frame] = []
         self._recent: deque[tuple[float, int]] = deque()
         self._started_at = time.time()
 
@@ -136,16 +117,19 @@ class DemoController(CaptureController):
         self._stats_timer.setInterval(500)
         self._stats_timer.timeout.connect(self._emit_stats)
 
-        self._alert_timer = QTimer(self)
-        self._alert_timer.setInterval(13000)
-        self._alert_timer.timeout.connect(self._emit_alert)
+        # 异常演示：每 30 秒轮换一种
+        self._burst_timer = QTimer(self)
+        self._burst_timer.setInterval(BURST_INTERVAL_MS)
+        self._burst_timer.timeout.connect(self._begin_burst)
 
-        self._alert_rules = [
-            ("SYN_FLOOD", "critical", "192.168.1.50:80", "SYN 620/s，SYN-ACK 12/s"),
-            ("ICMP_ECHO_FLOOD", "critical", "192.168.1.88", "echo request 340/s"),
-            ("ICMP_ORPHAN_REPLY", "warning", "10.0.0.6", "5 秒内 37 条无请求 reply"),
-            ("ICMP_BIG_ECHO", "info", "192.168.1.77", "载荷 1400 B，MF=1"),
-        ]
+        self._burst_tick = QTimer(self)
+        self._burst_tick.setInterval(8)
+        self._burst_tick.timeout.connect(self._burst_step)
+
+        self._burst_kinds = ["syn_flood", "icmp_flood", "orphan_reply", "big_echo"]
+        self._burst_index = 0
+        self._burst_remaining = 0
+        self._burst_builder = None
 
     # ---------------------------------------------------------------- 设备
     def list_devices(self) -> list[DeviceOption]:
@@ -164,7 +148,7 @@ class DemoController(CaptureController):
         self.state_changed.emit("running", f"抓包中（演示数据）：{device_key}")
         self._tick_timer.start()
         self._stats_timer.start()
-        self._alert_timer.start()
+        self._burst_timer.start()
         self._emit_stats()
 
     def stop(self) -> None:
@@ -173,8 +157,9 @@ class DemoController(CaptureController):
         self._running = False
         self._tick_timer.stop()
         self._stats_timer.stop()
-        self._alert_timer.stop()
-        self.state_changed.emit("idle", "已停止")
+        self._burst_timer.stop()
+        self._burst_tick.stop()
+        self.state_changed.emit("idle", "已停止（演示数据未落盘）")
         self._emit_stats()
 
     def shutdown(self) -> None:
@@ -182,17 +167,34 @@ class DemoController(CaptureController):
 
     # ---------------------------------------------------------------- 文件
     def save_as(self, path: str) -> None:
-        raise NotImplementedError("演示模式不支持保存")
+        if not self._frames:
+            raise PcapError("演示会话还没有数据，无可保存内容")
+        writer = PcapWriter(path)
+        try:
+            for frame in self._frames:
+                writer.write(frame)
+        finally:
+            writer.close()
 
     def open_file(self, path: str) -> None:
-        raise NotImplementedError("演示模式不支持打开文件")
+        self.stop()
+        frames = read_frames(path)
+        self._reset()
+        self._running = False
+        rows = []
+        for frame in frames:
+            rows.append(self._process(frame, count_frame=True))
+        if rows:
+            self.packets_received.emit(rows)
+        self._emit_stats()
+        self.state_changed.emit("idle", f"已打开 {Path(path).name}（{len(rows)} 个报文）")
 
     # ---------------------------------------------------------------- 内部
     def _reset(self) -> None:
         self._seq = 0
-        self._received = 0
-        self._hist.clear()
-        self._versions = [0, 0, 0]
+        self._stats.reset()
+        self._alerts.reset()
+        self._frames.clear()
         self._recent.clear()
         self._started_at = time.time()
 
@@ -200,211 +202,149 @@ class DemoController(CaptureController):
         rows = []
         for _ in range(random.randint(1, 4)):
             self._seq += 1
-            rows.append(self._make_row(self._seq))
+            rows.append(self._process(self._to_frame(self._make_packet()), count_frame=True))
         if rows:
             self.packets_received.emit(rows)
-            # 演示数据每批都刷新统计，避免状态栏"包数"落后于列表
             self._emit_stats()
 
-    def _endpoints(self, kind: str) -> tuple[str, str]:
-        if kind == "synack":
-            return SERVER_IP, CLIENT_IP
-        if kind == "icmp":
-            return GATEWAY_IP, SERVER_IP
-        if kind == "arp":
-            return CLIENT_IP, GATEWAY_IP
-        if kind == "ipv6":
-            return CLIENT_IP6, DNS_IP6
-        return CLIENT_IP, SERVER_IP
-
-    def _make_row(self, seq: int) -> PacketRow:
+    # ---------------------------------------------------------------- 报文
+    def _make_packet(self) -> bytes:
         kind = random.choices(
             ["syn", "synack", "ack", "http", "dns", "icmp", "arp", "ipv6"],
-            weights=[18, 12, 30, 10, 10, 8, 7, 5],
+            weights=[18, 12, 30, 10, 10, 4, 7, 5],
         )[0]
-        raw, protocol, length, info, version, layers = self._build(kind)
-        src, dst = self._endpoints(kind)
-
-        now = time.time()
-        self._received += 1
-        self._hist[length] = self._hist.get(length, 0) + 1
-        self._versions[0 if version == 4 else 1 if version == 6 else 2] += 1
-        self._recent.append((now, length))
-        while self._recent and now - self._recent[0][0] > 1.0:
-            self._recent.popleft()
-
-        return PacketRow(
-            seq=seq,
-            ts=now,
-            src=src,
-            dst=dst,
-            protocol=protocol,
-            length=length,
-            info=info,
-            raw=raw,
-            layers=layers,
-            version=version,
-        )
-
-    def _build(self, kind: str):
         if kind == "syn":
-            seq = random.randint(1000, 9000)
-            tcp = _tcp(51432, 443, 0x02, seq, 0)
-            raw = _eth(GATEWAY_MAC, CLIENT_MAC, 0x0800, _ipv4(CLIENT_IP, SERVER_IP, 6, tcp))
-            layers = [
-                ("数据链路层（Ethernet II）", _layers_eth(GATEWAY_MAC, CLIENT_MAC, "IPv4 (0x0800)")),
-                ("网络层（IPv4）", _layers_ipv4(CLIENT_IP, SERVER_IP, 6)),
-                ("传输层（TCP）", _layers_tcp(51432, 443, 0x02, seq)),
-                ("附加信息", [("帧长", f"{len(raw)} B"), ("抓包长度", f"{len(raw)} B")]),
-            ]
-            return raw, "TCP", 40, f"51432 → 443 [SYN] Seq={seq} Len=0", 4, layers
-
+            return _eth(GATEWAY_MAC, CLIENT_MAC, 0x0800,
+                        _ipv4(CLIENT_IP, SERVER_IP, 6,
+                              _tcp(51432, 443, 0x02, random.randint(1000, 9000), 0)))
         if kind == "synack":
-            tcp = _tcp(443, 51432, 0x12, 0, 1001)
-            raw = _eth(CLIENT_MAC, GATEWAY_MAC, 0x0800, _ipv4(SERVER_IP, CLIENT_IP, 6, tcp))
-            layers = [
-                ("数据链路层（Ethernet II）", _layers_eth(CLIENT_MAC, GATEWAY_MAC, "IPv4 (0x0800)")),
-                ("网络层（IPv4）", _layers_ipv4(SERVER_IP, CLIENT_IP, 6)),
-                ("传输层（TCP）", _layers_tcp(443, 51432, 0x12, 0, 1001)),
-                ("附加信息", [("帧长", f"{len(raw)} B"), ("抓包长度", f"{len(raw)} B")]),
-            ]
-            return raw, "TCP", 40, "443 → 51432 [SYN, ACK] Seq=0 Ack=1001 Len=0", 4, layers
-
+            return _eth(CLIENT_MAC, GATEWAY_MAC, 0x0800,
+                        _ipv4(SERVER_IP, CLIENT_IP, 6,
+                              _tcp(443, 51432, 0x12, random.randint(1000, 9000), 1001)))
         if kind == "ack":
-            tcp = _tcp(51432, 443, 0x10, 1001, 1)
-            raw = _eth(GATEWAY_MAC, CLIENT_MAC, 0x0800, _ipv4(CLIENT_IP, SERVER_IP, 6, tcp))
-            layers = [
-                ("数据链路层（Ethernet II）", _layers_eth(GATEWAY_MAC, CLIENT_MAC, "IPv4 (0x0800)")),
-                ("网络层（IPv4）", _layers_ipv4(CLIENT_IP, SERVER_IP, 6)),
-                ("传输层（TCP）", _layers_tcp(51432, 443, 0x10, 1001, 1)),
-                ("附加信息", [("帧长", f"{len(raw)} B"), ("抓包长度", f"{len(raw)} B")]),
-            ]
-            return raw, "TCP", 40, "51432 → 443 [ACK] Seq=1001 Ack=1 Len=0", 4, layers
-
+            return _eth(GATEWAY_MAC, CLIENT_MAC, 0x0800,
+                        _ipv4(CLIENT_IP, SERVER_IP, 6,
+                              _tcp(51432, 443, 0x10, 1001, 1)))
         if kind == "http":
             payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
-            tcp = _tcp(51432, 443, 0x18, 1001, 1, payload)
-            raw = _eth(GATEWAY_MAC, CLIENT_MAC, 0x0800, _ipv4(CLIENT_IP, SERVER_IP, 6, tcp))
-            layers = [
-                ("数据链路层（Ethernet II）", _layers_eth(GATEWAY_MAC, CLIENT_MAC, "IPv4 (0x0800)")),
-                ("网络层（IPv4）", _layers_ipv4(CLIENT_IP, SERVER_IP, 6)),
-                ("传输层（TCP）", _layers_tcp(51432, 443, 0x18, 1001, 1)),
-                ("附加信息", [("帧长", f"{len(raw)} B"), ("抓包长度", f"{len(raw)} B")]),
-            ]
-            info = f"51432 → 443 [PSH, ACK] Seq=1001 Ack=1 Len={len(payload)}"
-            return raw, "TCP", 20 + len(tcp), info, 4, layers
-
+            return _eth(GATEWAY_MAC, CLIENT_MAC, 0x0800,
+                        _ipv4(CLIENT_IP, SERVER_IP, 6,
+                              _tcp(51432, 443, 0x18, 1001, 1, payload)))
         if kind == "dns":
             payload = (
                 b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
                 b"\x07example\x03com\x00\x00\x01\x00\x01"
             )
-            udp = _udp(53012, 53, payload)
-            raw = _eth(GATEWAY_MAC, CLIENT_MAC, 0x0800, _ipv4(CLIENT_IP, SERVER_IP, 17, udp))
-            layers = [
-                ("数据链路层（Ethernet II）", _layers_eth(GATEWAY_MAC, CLIENT_MAC, "IPv4 (0x0800)")),
-                ("网络层（IPv4）", _layers_ipv4(CLIENT_IP, SERVER_IP, 17)),
-                ("传输层（UDP）", [("源端口", "53012"), ("目的端口", "53"), ("长度", str(8 + len(payload)))]),
-                ("附加信息", [("帧长", f"{len(raw)} B"), ("抓包长度", f"{len(raw)} B")]),
-            ]
-            return raw, "UDP", 20 + len(udp), "53012 → 53 Standard query A example.com", 4, layers
-
+            return _eth(GATEWAY_MAC, CLIENT_MAC, 0x0800,
+                        _ipv4(CLIENT_IP, SERVER_IP, 17, _udp(53012, 53, payload)))
         if kind == "icmp":
             payload = b"abcdefghijklmnopqrstuvwxyz012345"
-            icmp = _icmp(8, 0, payload)
-            raw = _eth(GATEWAY_MAC, CLIENT_MAC, 0x0800, _ipv4(GATEWAY_IP, SERVER_IP, 1, icmp))
-            layers = [
-                ("数据链路层（Ethernet II）", _layers_eth(GATEWAY_MAC, CLIENT_MAC, "IPv4 (0x0800)")),
-                ("网络层（IPv4）", _layers_ipv4(GATEWAY_IP, SERVER_IP, 1)),
-                ("传输层（ICMP）", [("类型", "8 (Echo Request)"), ("代码", "0"), ("端口", "不适用")]),
-                ("附加信息", [("帧长", f"{len(raw)} B"), ("抓包长度", f"{len(raw)} B")]),
-            ]
-            return raw, "ICMP", 20 + len(icmp), "Echo (ping) request id=0x0001 seq=1 ttl=64", 4, layers
-
+            return _eth(GATEWAY_MAC, CLIENT_MAC, 0x0800,
+                        _ipv4(GATEWAY_IP, SERVER_IP, 1, _icmp(8, 0, payload)))
         if kind == "arp":
             arp = struct.pack(
                 "!HHBBH6s4s6s4s",
-                1,
-                0x0800,
-                6,
-                4,
-                1,
-                _mac(CLIENT_MAC),
-                socket.inet_aton(CLIENT_IP),
-                b"\x00" * 6,
-                socket.inet_aton(GATEWAY_IP),
+                1, 0x0800, 6, 4, 1,
+                _mac(CLIENT_MAC), socket.inet_aton(CLIENT_IP),
+                b"\x00" * 6, socket.inet_aton(GATEWAY_IP),
             )
-            raw = _eth(BROADCAST_MAC, CLIENT_MAC, 0x0806, arp)
-            layers = [
-                ("数据链路层（Ethernet II）", _layers_eth(BROADCAST_MAC, CLIENT_MAC, "ARP (0x0806)")),
-                ("网络层", [("类型", "ARP"), ("说明", "IPv4 地址解析")]),
-                ("传输层", [("说明", "不适用")]),
-                ("附加信息", [("帧长", f"{len(raw)} B"), ("抓包长度", f"{len(raw)} B")]),
-            ]
-            return raw, "ARP", len(raw), "Who has 192.168.1.1? Tell 192.168.1.23", 0, layers
-
+            return _eth(BROADCAST_MAC, CLIENT_MAC, 0x0806, arp)
         # ipv6 DNS
         payload = (
             b"\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
             b"\x07example\x03com\x00\x00\x1c\x00\x01"
         )
-        udp = _udp(53013, 53, payload)
-        raw = _eth(GATEWAY_MAC, CLIENT_MAC, 0x86DD, _ipv6(CLIENT_IP6, DNS_IP6, 17, udp))
-        layers = [
-            ("数据链路层（Ethernet II）", _layers_eth(GATEWAY_MAC, CLIENT_MAC, "IPv6 (0x86DD)")),
-            (
-                "网络层（IPv6）",
-                [
-                    ("版本", "6"),
-                    ("源 IP", CLIENT_IP6),
-                    ("目的 IP", DNS_IP6),
-                    ("跳数限制", "64"),
-                    ("协议号", "17 (UDP)"),
-                ],
-            ),
-            ("传输层（UDP）", [("源端口", "53013"), ("目的端口", "53"), ("长度", str(8 + len(payload)))]),
-            ("附加信息", [("帧长", f"{len(raw)} B"), ("抓包长度", f"{len(raw)} B")]),
-        ]
-        return raw, "UDP", 40 + len(udp), "53013 → 53 Standard query AAAA example.com", 6, layers
+        return _eth(GATEWAY_MAC, CLIENT_MAC, 0x86DD,
+                    _ipv6(CLIENT_IP6, DNS_IP6, 17, _udp(53013, 53, payload)))
 
+    def _process(self, frame: Frame, count_frame: bool = False):
+        parsed = parse_frame(frame)
+        self._stats.add(parsed)
+        alert = self._alerts.ingest(parsed)
+        if alert is not None:
+            self.alert_raised.emit(alert)
+        if count_frame:
+            self._frames.append(frame)
+            if len(self._frames) > MAX_DEMO_FRAMES:
+                del self._frames[:MAX_DEMO_FRAMES // 2]
+            now = time.time()
+            self._recent.append((now, frame.origlen))
+            while self._recent and now - self._recent[0][0] > 1.0:
+                self._recent.popleft()
+        self._seq += 1
+        return build_packet_row(parsed, self._seq)
+
+    @staticmethod
+    def _to_frame(raw: bytes) -> Frame:
+        return Frame(ts=time.time(), caplen=len(raw), origlen=len(raw), data=raw)
+
+    # ---------------------------------------------------------------- 异常演示
+    def _begin_burst(self) -> None:
+        if self._burst_remaining > 0:
+            return
+        kind = self._burst_kinds[self._burst_index % len(self._burst_kinds)]
+        self._burst_index += 1
+        seq = random.randint(1000, 9000)
+
+        if kind == "syn_flood":
+            self._burst_remaining = 360
+            self._burst_builder = lambda: _eth(  # noqa: E731
+                GATEWAY_MAC, CLIENT_MAC, 0x0800,
+                _ipv4(CLIENT_IP, FLOOD_TARGET, 6,
+                      _tcp(random.randint(20000, 60000), 80, 0x02, seq, 0)),
+            )
+        elif kind == "icmp_flood":
+            self._burst_remaining = 200
+            self._burst_builder = lambda: _eth(  # noqa: E731
+                GATEWAY_MAC, CLIENT_MAC, 0x0800,
+                _ipv4(GATEWAY_IP, SERVER_IP, 1, _icmp(8, 0, b"ping" * 8)),
+            )
+        elif kind == "orphan_reply":
+            self._burst_remaining = 30
+            self._burst_builder = lambda: _eth(  # noqa: E731
+                GATEWAY_MAC, CLIENT_MAC, 0x0800,
+                _ipv4(GATEWAY_IP, SERVER_IP, 1, _icmp(0, 0, b"pong" * 8)),
+            )
+        else:  # big_echo：1400 B 载荷 + MF 分片
+            self._burst_remaining = 1
+            self._burst_builder = lambda: _eth(  # noqa: E731
+                GATEWAY_MAC, CLIENT_MAC, 0x0800,
+                _ipv4(GATEWAY_IP, SERVER_IP, 1, _icmp(8, 0, b"x" * 1400),
+                      flags=0x2000),
+            )
+        self._burst_tick.start()
+
+    def _burst_step(self) -> None:
+        for _ in range(min(3, self._burst_remaining)):
+            self._seq += 1
+            row = self._process(self._to_frame(self._burst_builder()), count_frame=True)
+            self.packets_received.emit([row])
+        self._burst_remaining -= min(3, self._burst_remaining)
+        if self._burst_remaining <= 0:
+            self._burst_tick.stop()
+
+    # ---------------------------------------------------------------- 统计
     def _emit_stats(self) -> None:
         now = time.time()
         while self._recent and now - self._recent[0][0] > 1.0:
             self._recent.popleft()
 
-        buckets = [
-            sum(count for length, count in self._hist.items() if length <= 46),
-            sum(count for length, count in self._hist.items() if 46 < length <= 1500),
-            sum(count for length, count in self._hist.items() if length > 1500),
-        ]
+        snapshot = self._stats.snapshot()
         pps = float(len(self._recent))
         mbps = sum(size for _, size in self._recent) * 8 / 1_000_000
 
         self.stats_updated.emit(
             {
-                "received": self._received,
-                "displayed": self._received,
+                "received": snapshot["total_packets"],
+                "displayed": snapshot["total_packets"],
                 "dropped": 0,
                 "pps": pps,
                 "mbps": mbps,
                 "uptime_s": time.time() - self._started_at,
-                "length_hist": dict(self._hist),
-                "buckets": tuple(buckets),
-                "ip_versions": tuple(self._versions),
-            }
-        )
-
-    def _emit_alert(self) -> None:
-        if not self._running:
-            return
-        rule, severity, target, evidence = random.choice(self._alert_rules)
-        self.alert_raised.emit(
-            {
-                "time": time.time(),
-                "rule": rule,
-                "severity": severity,
-                "target": target,
-                "evidence": evidence,
-                "count": 1,
+                "started_at": self._started_at,
+                "length_hist": snapshot["length_hist"],
+                "buckets": snapshot["buckets"],
+                "ip_versions": snapshot["ip_versions"],
+                "protocol_counts": snapshot["protocol_counts"],
             }
         )
