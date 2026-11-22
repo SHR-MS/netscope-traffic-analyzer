@@ -70,6 +70,11 @@ class MainWindow(QMainWindow):
         self._auto_selecting = False
         self._stats: dict = {}
         self._capturing = False
+        # 程序自身的启动时间：运行时长按它算，断网后重启抓包不会清零
+        self._app_started_at = time.time()
+        self._last_received = 0
+        self._last_traffic_at = time.time()
+        self._stall_warned = False
         self._resource_csv = None          # 打开中的资源占用 CSV 文件
         self._resource_writer = None
         self._resource_csv_started = 0.0
@@ -305,7 +310,7 @@ class MainWindow(QMainWindow):
         self.start_label = QLabel("开始 --:--:--")
         self.start_label.setToolTip("本次抓包的开始时间")
         self.uptime_label = QLabel("运行 0天 00:00:00")
-        self.uptime_label.setToolTip("本次抓包运行时长")
+        self.uptime_label.setToolTip("程序运行时长（从启动算起，断网后重新抓包也不清零）")
         self.res_label = QLabel("资源 —")
         self.res_label.setToolTip("本进程 CPU / 内存占用（需要 psutil，每 5 秒记入资源占用.csv）")
         for label in (
@@ -398,8 +403,23 @@ class MainWindow(QMainWindow):
             )
         else:
             self.start_label.setText("开始 --:--:--")
-        self.uptime_label.setText(f"运行 {self._fmt_uptime(float(stats.get('uptime_s', 0.0)))}")
         self.shown_label.setText(f"显示 {self.proxy.rowCount():,}")
+
+        # 包数有变化说明抓包仍在工作；长时间不涨就提示，可能是网卡断了
+        received = int(stats.get("received", 0))
+        if received != self._last_received:
+            self._last_received = received
+            self._last_traffic_at = time.time()
+            self._stall_warned = False
+        elif (
+            self._capturing
+            and not self._stall_warned
+            and time.time() - self._last_traffic_at > 600
+        ):
+            self._stall_warned = True
+            self.statusBar().showMessage(
+                "已经 10 分钟没有抓到新报文，请检查网卡是否断开（校园网掉线后可能如此）", 15000
+            )
 
         directory = self.controller.session_dir()
         self.act_capture_dir.setEnabled(directory is not None)
@@ -526,7 +546,7 @@ class MainWindow(QMainWindow):
         self.drop_label.setText("丢包 0")
         self.rate_label.setText("0 pkt/s")
         self.start_label.setText("开始 --:--:--")
-        self.uptime_label.setText("运行 0天 00:00:00")
+        self.uptime_label.setText(f"运行 {self._fmt_uptime(time.time() - self._app_started_at)}")
         self.act_capture_dir.setEnabled(False)
 
     # ================================================================ 状态
@@ -569,6 +589,11 @@ class MainWindow(QMainWindow):
 
     # ================================================================ 资源
     def _on_resource_tick(self) -> None:
+        # 运行时长按程序启动时间算，抓包重启/断网都不清零
+        self.uptime_label.setText(
+            f"运行 {self._fmt_uptime(time.time() - self._app_started_at)}"
+        )
+
         if _psutil is None:
             self.res_label.setText("资源 需安装 psutil")
             return
@@ -633,7 +658,7 @@ class MainWindow(QMainWindow):
             self._resource_writer.writerow(
                 [
                     time.strftime("%Y-%m-%d %H:%M:%S"),
-                    round(float(stats.get("uptime_s", 0.0)), 1),
+                    round(time.time() - self._app_started_at, 1),
                     int(stats.get("received", 0)),
                     round(cpu, 1),
                     round(rss_mb, 1),
