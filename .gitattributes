@@ -1,5 +1,7 @@
-# 行尾统一为 LF，避免 Windows/Linux 混用导致全文件 diff 噪音
+# 统一行尾：文本 LF；Windows 批处理必须 CRLF，否则 goto 标签会失效
 * text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
 *.png binary
 *.pcap binary
 *.pcapng binary

@@ -11,7 +11,12 @@ env/
 .mypy_cache/
 .ruff_cache/
 
-# 抓包与运行产物
+# 运行产物
+告警测试日志.txt
+测试输出.txt
+resources/
+
+# 抓包文件
 *.pcap
 *.pcapng
 captures/
