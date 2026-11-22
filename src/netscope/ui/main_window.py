@@ -66,6 +66,8 @@ class MainWindow(QMainWindow):
 
         self._alert_count = 0
         self._follow = True
+        self._pinned = False        # 用户是否手动钉住了某一行
+        self._auto_selecting = False
         self._stats: dict = {}
         self._capturing = False
         self._resource_csv = None          # 打开中的资源占用 CSV 文件
@@ -369,9 +371,17 @@ class MainWindow(QMainWindow):
         self.model.append_rows(rows)
         if self._follow:
             self.table.scrollToBottom()
-        if not self.table.currentIndex().isValid() and self.proxy.rowCount():
-            # 首次收到数据时选中最后一条，让详情树和十六进制有内容可看
-            self.table.setCurrentIndex(self.proxy.index(self.proxy.rowCount() - 1, 0))
+            # 跟随模式且用户没有手动钉住某行时，选中最新一条，
+            # 让详情树/十六进制始终显示最新报文（列表只保留最近 5000 行，
+            # 旧行被挤出后选中会停在中途，这里主动纠正）。
+            if not self._pinned and self.proxy.rowCount():
+                self._auto_selecting = True
+                try:
+                    self.table.setCurrentIndex(
+                        self.proxy.index(self.proxy.rowCount() - 1, 0)
+                    )
+                finally:
+                    self._auto_selecting = False
         self.shown_label.setText(f"显示 {self.proxy.rowCount():,}")
 
     def _on_stats(self, stats: dict) -> None:
@@ -419,6 +429,9 @@ class MainWindow(QMainWindow):
         )
 
     def _on_current_row_changed(self, current: QModelIndex, previous: QModelIndex) -> None:
+        if not self._auto_selecting and self._follow:
+            # 用户主动选中某行：暂停自动跟随，避免每批新报文都抢走选择
+            self._pinned = True
         if not current.isValid():
             self.detail.show_packet(None)
             self.hex.set_data(b"")
@@ -431,6 +444,9 @@ class MainWindow(QMainWindow):
     def _on_scroll(self, value: int) -> None:
         bar = self.table.verticalScrollBar()
         self._follow = value >= bar.maximum() - 4
+        if self._follow:
+            # 滚回底部：恢复跟随最新报文
+            self._pinned = False
 
     # ================================================================ 动作
     def _on_start(self) -> None:
