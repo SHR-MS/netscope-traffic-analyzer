@@ -617,9 +617,8 @@ class MainWindow(QMainWindow):
         shown_cpu = self._proc_cpu_total / max(1, self._proc_samples)
         self.res_label.setText(f"CPU {shown_cpu:.1f}%  内存 {rss_mb:.1f} MB")
 
-        if not self._capturing:
-            self._close_resource_csv()
-            return
+        # 只要本次会话的捕获目录存在就持续记录（停止抓包也记），
+        # 这样半夜掉线、重新开始抓包都不会在资源曲线上留下缺口
         directory = self.controller.session_dir()
         if directory is None:
             self._close_resource_csv()
