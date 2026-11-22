@@ -2,12 +2,22 @@
 
 界面只通过 :class:`CaptureController` 的信号拿数据；
 默认接真实采集（:class:`LiveController`），``--demo`` 时用演示数据源。
+
+长时间运行（1 天以上）支持：
+- 状态栏实时显示运行时长与开始时间；
+- 每秒采样本进程 CPU / 内存占用，每 5 秒写入捕获目录下的
+  ``资源占用.csv``，供"观察并记录系统消耗资源"的实验报告使用；
+- 报文列表、告警、统计均有界，原始数据滚动落盘，内存不随运行增长。
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import QModelIndex, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+import csv
+import time
+from pathlib import Path
+
+from PySide6.QtCore import QModelIndex, QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -36,6 +46,13 @@ from .live_controller import LiveController
 from .models import PacketFilterProxy, PacketRow, PacketTableModel
 from .widgets import AlertsView, DetailTree, HexView
 
+try:
+    import psutil as _psutil
+except ImportError:  # psutil 是可选依赖，缺失时资源面板显示提示
+    _psutil = None
+
+RESOURCE_SAMPLE_S = 5  # 资源占用 CSV 的写入间隔（秒）
+
 
 class MainWindow(QMainWindow):
     def __init__(self, controller: CaptureController | None = None, demo: bool = False, parent=None) -> None:
@@ -50,6 +67,14 @@ class MainWindow(QMainWindow):
         self._alert_count = 0
         self._follow = True
         self._stats: dict = {}
+        self._capturing = False
+        self._resource_csv = None          # 打开中的资源占用 CSV 文件
+        self._resource_writer = None
+        self._resource_csv_started = 0.0
+        self._resource_rows_written = 0
+        self._process = None               # psutil.Process
+        self._proc_cpu_total = 0.0
+        self._proc_samples = 0
 
         self.setWindowTitle("NetScope 网络流量分析系统")
         self.setWindowIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
@@ -66,6 +91,11 @@ class MainWindow(QMainWindow):
         self._wire()
         self._refresh_devices()
         self._update_state("idle", "")
+
+        self._resource_timer = QTimer(self)
+        self._resource_timer.setInterval(1000)
+        self._resource_timer.timeout.connect(self._on_resource_tick)
+        self._resource_timer.start()
 
         if self.controller.demo:
             QTimer.singleShot(350, self._on_start)
@@ -92,6 +122,10 @@ class MainWindow(QMainWindow):
         self.act_save = QAction(style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "另存为...", self)
         self.act_save.setShortcut(QKeySequence("Ctrl+S"))
         self.act_save.triggered.connect(self._on_save)
+
+        self.act_capture_dir = QAction("打开捕获目录...", self)
+        self.act_capture_dir.setEnabled(False)
+        self.act_capture_dir.triggered.connect(self._on_open_capture_dir)
 
         self.act_refresh = QAction(style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload), "刷新网卡", self)
         self.act_refresh.triggered.connect(self._refresh_devices)
@@ -123,6 +157,8 @@ class MainWindow(QMainWindow):
         file_menu = bar.addMenu("文件(&F)")
         file_menu.addAction(self.act_open)
         file_menu.addAction(self.act_save)
+        file_menu.addSeparator()
+        file_menu.addAction(self.act_capture_dir)
         file_menu.addSeparator()
         file_menu.addAction(self.act_quit)
 
@@ -264,13 +300,20 @@ class MainWindow(QMainWindow):
         self.shown_label = QLabel("显示 0")
         self.drop_label = QLabel("丢包 0")
         self.rate_label = QLabel("0 pkt/s")
+        self.start_label = QLabel("开始 --:--:--")
+        self.start_label.setToolTip("本次抓包的开始时间")
         self.uptime_label = QLabel("运行 0天 00:00:00")
+        self.uptime_label.setToolTip("本次抓包运行时长")
+        self.res_label = QLabel("资源 —")
+        self.res_label.setToolTip("本进程 CPU / 内存占用（需要 psutil，每 5 秒记入资源占用.csv）")
         for label in (
             self.count_label,
             self.shown_label,
             self.drop_label,
             self.rate_label,
+            self.start_label,
             self.uptime_label,
+            self.res_label,
         ):
             bar.addPermanentWidget(label)
 
@@ -338,8 +381,18 @@ class MainWindow(QMainWindow):
         self.count_label.setText(f"包数 {int(stats.get('received', 0)):,}")
         self.drop_label.setText(f"丢包 {int(stats.get('dropped', 0)):,}")
         self.rate_label.setText(f"{float(stats.get('pps', 0.0)):,.0f} pkt/s")
+        started_at = stats.get("started_at") or 0.0
+        if started_at > 0:
+            self.start_label.setText(
+                f"开始 {time.strftime('%H:%M:%S', time.localtime(started_at))}"
+            )
+        else:
+            self.start_label.setText("开始 --:--:--")
         self.uptime_label.setText(f"运行 {self._fmt_uptime(float(stats.get('uptime_s', 0.0)))}")
         self.shown_label.setText(f"显示 {self.proxy.rowCount():,}")
+
+        directory = self.controller.session_dir()
+        self.act_capture_dir.setEnabled(directory is not None)
 
         self.line_chart.set_histogram(stats.get("length_hist") or {}, 8)
 
@@ -456,7 +509,9 @@ class MainWindow(QMainWindow):
         self.shown_label.setText("显示 0")
         self.drop_label.setText("丢包 0")
         self.rate_label.setText("0 pkt/s")
+        self.start_label.setText("开始 --:--:--")
         self.uptime_label.setText("运行 0天 00:00:00")
+        self.act_capture_dir.setEnabled(False)
 
     # ================================================================ 状态
     def _update_state(self, state: str, message: str) -> None:
@@ -471,8 +526,11 @@ class MainWindow(QMainWindow):
         self.state_label.setStyleSheet(f"color: {color}; padding: 0 6px;")
 
         running = state == "running"
+        self._capturing = running
         self.act_start.setEnabled(not running)
         self.act_stop.setEnabled(running)
+        if not running:
+            self._close_resource_csv()
         if message:
             self.statusBar().showMessage(message, 5000)
 
@@ -484,6 +542,103 @@ class MainWindow(QMainWindow):
         minutes, secs = divmod(remainder, 60)
         return f"{days}天 {hours:02d}:{minutes:02d}:{secs:02d}"
 
+    def _on_open_capture_dir(self) -> None:
+        directory = self.controller.session_dir()
+        if directory is None or not Path(directory).is_dir():
+            QMessageBox.information(
+                self, "捕获目录", "还没有开始抓包，暂时没有捕获目录。\n开始抓包后自动落盘的 pcap 与资源占用.csv 会保存在这里。"
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+
+    # ================================================================ 资源
+    def _on_resource_tick(self) -> None:
+        if _psutil is None:
+            self.res_label.setText("资源 需安装 psutil")
+            return
+        if self._process is None:
+            try:
+                self._process = _psutil.Process()
+            except Exception:  # noqa: BLE001
+                self.res_label.setText("资源 —")
+                return
+
+        try:
+            cpu = self._process.cpu_percent(None)
+            rss_mb = self._process.memory_info().rss / 1024 / 1024
+        except Exception:  # noqa: BLE001
+            self.res_label.setText("资源 —")
+            return
+
+        # cpu_percent 首次调用返回 0，累计几次再显示，避免误导
+        self._proc_cpu_total += cpu
+        self._proc_samples += 1
+        shown_cpu = self._proc_cpu_total / max(1, self._proc_samples)
+        self.res_label.setText(f"CPU {shown_cpu:.1f}%  内存 {rss_mb:.1f} MB")
+
+        if not self._capturing:
+            self._close_resource_csv()
+            return
+        directory = self.controller.session_dir()
+        if directory is None:
+            self._close_resource_csv()
+            return
+        self._open_resource_csv(directory)
+        if self._resource_writer is None:
+            return
+        elapsed = time.time() - self._resource_csv_started
+        if self._resource_rows_written * RESOURCE_SAMPLE_S > elapsed:
+            return
+        self._append_resource_row(shown_cpu, rss_mb)
+
+    def _open_resource_csv(self, directory) -> None:
+        if self._resource_csv is not None:
+            return
+        try:
+            path = Path(directory) / "资源占用.csv"
+            self._resource_csv = path.open("a", newline="", encoding="utf-8-sig")
+            self._resource_writer = csv.writer(self._resource_csv)
+            if path.stat().st_size == 0:
+                self._resource_writer.writerow(
+                    ["时间", "运行时长(秒)", "包数", "CPU(%)", "内存(MB)"]
+                )
+            self._resource_csv_started = time.time()
+            self._resource_rows_written = 0
+        except OSError:
+            self._resource_csv = None
+            self._resource_writer = None
+
+    def _append_resource_row(self, cpu: float, rss_mb: float) -> None:
+        self._open_resource_csv(self.controller.session_dir())
+        if self._resource_writer is None:
+            return
+        stats = self._stats or {}
+        try:
+            self._resource_writer.writerow(
+                [
+                    time.strftime("%Y-%m-%d %H:%M:%S"),
+                    round(float(stats.get("uptime_s", 0.0)), 1),
+                    int(stats.get("received", 0)),
+                    round(cpu, 1),
+                    round(rss_mb, 1),
+                ]
+            )
+            self._resource_csv.flush()
+            self._resource_rows_written += 1
+        except OSError:
+            self._close_resource_csv()
+
+    def _close_resource_csv(self) -> None:
+        if self._resource_csv is not None:
+            try:
+                self._resource_csv.flush()
+                self._resource_csv.close()
+            except OSError:
+                pass
+        self._resource_csv = None
+        self._resource_writer = None
+        self._resource_rows_written = 0
+
     # ================================================================ 其他
     def _show_about(self) -> None:
         mode = "演示数据" if self.controller.demo else "真实抓包（需要 Npcap + 管理员）"
@@ -491,10 +646,11 @@ class MainWindow(QMainWindow):
             self,
             "关于 NetScope",
             "<b>NetScope 网络流量分析系统</b><br><br>"
-            "PySide6 界面 + Scapy/Npcap 采集：报文列表、三层字段详情、十六进制、"
-            "长度分布 / 长度分段 / IP 版本图表、告警列表。<br><br>"
+            "PySide6 界面 + Scapy/Npcap 采集：报文列表、三层字段详情（MAC/IP/TTL/协议号/"
+            "端口/TCP 标志）、十六进制、长度分布 / 长度分段 / IP 版本统计图表、"
+            "pcap 保存与回放、SYN 泛洪 / ICMP 异常告警、资源占用记录。<br><br>"
             f"当前模式：{mode}。<br>"
-            "字段解析与统计仍在接入中，详情树暂只显示链路层。",
+            "抓包时原始数据自动滚动落盘（文档/NetScope），可运行 1 天以上。",
         )
 
     def _show_usage(self) -> None:
@@ -502,14 +658,19 @@ class MainWindow(QMainWindow):
             self,
             "使用说明",
             "1. 工具栏选择网卡，F5 开始 / Shift+F5 停止。\n"
-            "2. 点击报文行，下方显示字段详情和十六进制。\n"
-            "3. 右侧“统计”面板：长度分布、长度分段、IP 版本、告警。\n"
-            "4. 顶部“显示过滤”只过滤列表，不影响抓包。\n\n"
+            "2. 点击报文行，下方显示链路层/网络层/传输层字段与十六进制。\n"
+            "3. 右侧“统计”面板：长度分布折线、长度分段柱状、IP 版本柱状、告警。\n"
+            "4. 顶部“显示过滤”只过滤列表，不影响抓包。\n"
+            "5. 文件菜单：“另存为”把捕获数据保存为 pcap；“打开”回放 pcap/pcapng；\n"
+            "   “打开捕获目录”查看自动落盘文件与资源占用.csv。\n"
+            "6. 状态栏显示包数、丢包、速率、开始时间与运行时长、CPU/内存占用。\n\n"
             "没有 Npcap 或不是管理员时，启动会给出提示；\n"
-            "只想看界面可用 --demo 启动演示数据。",
+            "只想看界面可用 --demo 启动演示数据（含异常流量告警演示）。",
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        self._resource_timer.stop()
+        self._close_resource_csv()
         try:
             self.controller.shutdown()
         except Exception:  # noqa: BLE001
